@@ -1,0 +1,11 @@
+.DS_Store
+.env
+__pycache__/
+*.pyc
+venv/
+
+bot.telegram/.env
+bot.telegram/.idea/
+bot.telegram/images/
+bot.telegram/users.txt
+bot.telegram/scores.txt

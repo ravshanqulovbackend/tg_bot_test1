@@ -1,178 +1,336 @@
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-
+from pathlib import Path
 import os
 import random
 
-TOKEN = "8607677602:AAFVMc1Bw2iT7aw3RsOA3TaGJtvUAW-O2ko"
-ADMIN_ID = 930999333
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.error import TelegramError
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# Fayl va papkalarni tekshirish
-if not os.path.exists("users.txt"):
-    open("users.txt", "w", encoding="utf-8").close()
-if not os.path.exists("images"):
-    os.makedirs("images")
-if not os.path.exists("scores.txt"):
-    
-    open("scores.txt", "w", encoding="utf-8").close()
 
-messages_dict = {}  # Maxfiy chat xabarlari
+BASE_DIR = Path(__file__).resolve().parent
+USERS_FILE = BASE_DIR / "users.txt"
+SCORES_FILE = BASE_DIR / "scores.txt"
+IMAGES_DIR = BASE_DIR / "images"
+ENV_FILE = BASE_DIR / ".env"
 
-# ===== /start =====
+
+def load_env_file():
+    if not ENV_FILE.exists():
+        return
+
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_env_file()
+
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi. bot.telegram/.env fayliga BOT_TOKEN yozing.")
+
+USERS_FILE.touch(exist_ok=True)
+SCORES_FILE.touch(exist_ok=True)
+IMAGES_DIR.mkdir(exist_ok=True)
+
+
+def read_users():
+    users = {}
+    for line in USERS_FILE.read_text(encoding="utf-8").splitlines():
+        if " - " not in line:
+            continue
+
+        user_id, user_name = line.split(" - ", 1)
+        if user_id.isdigit():
+            users[int(user_id)] = user_name.strip()
+    return users
+
+
+def save_user(user_id, user_name):
+    users = read_users()
+    users[user_id] = user_name
+
+    with USERS_FILE.open("w", encoding="utf-8") as file:
+        for saved_user_id, saved_user_name in users.items():
+            file.write(f"{saved_user_id} - {saved_user_name}\n")
+
+
+def main_menu():
+    keyboard = [
+        [InlineKeyboardButton("👑 Bot asoschisi", callback_data="founder")],
+        [InlineKeyboardButton("📷 Rasm yuborish", callback_data="upload")],
+        [InlineKeyboardButton("💬 Xabar yuborish", callback_data="message")],
+        [InlineKeyboardButton("🎮 Quiz o'ynash", callback_data="quiz")],
+        [InlineKeyboardButton("📝 Profilim", callback_data="profile")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def users_keyboard(current_user_id):
+    buttons = []
+    users = read_users()
+
+    for user_id, user_name in users.items():
+        if user_id == current_user_id:
+            continue
+        buttons.append([InlineKeyboardButton(user_name, callback_data=f"chat_{user_id}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Menyu", callback_data="menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    user_name = update.message.from_user.full_name
-
-    # Foydalanuvchini ro‘yxatga olish
-    with open("users.txt", "r", encoding="utf-8") as f:
-        users = [line.split(" - ")[0] for line in f.readlines()]
-    if str(user_id) not in users:
-        with open("users.txt", "a", encoding="utf-8") as f:
-            f.write(f"{user_id} - {user_name}\n")
+    user = update.effective_user
+    save_user(user.id, user.full_name)
 
     context.user_data["waiting_for_name"] = True
     await update.message.reply_text("Salom! Avval ismingizni yozing:")
 
-# ===== Ism qabul qilish =====
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    text = update.message.text.strip()
 
-    # Ism qabul qilish
-    if context.user_data.get("waiting_for_name", False):
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    save_user(user_id, update.effective_user.full_name)
+
+    users = read_users()
+    if len(users) <= 1:
+        await update.message.reply_text("Hozircha boshqa foydalanuvchilar yo'q.")
+        return
+
+    await update.message.reply_text(
+        "Kimga xabar yubormoqchisiz?",
+        reply_markup=users_keyboard(user_id),
+    )
+
+
+async def reply_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Format: /reply <user_id> <xabar>")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("User ID faqat raqam bo'lishi kerak.")
+        return
+
+    message = " ".join(context.args[1:]).strip()
+    if not message:
+        await update.message.reply_text("Xabar matnini ham yozing.")
+        return
+
+    await send_user_message(update, context, target_user_id, message)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip()
+    save_user(user.id, user.full_name)
+
+    if context.user_data.get("waiting_for_name"):
         context.user_data["name"] = text
         context.user_data["waiting_for_name"] = False
 
-        # Telefon raqam tugmasi
         keyboard = [[KeyboardButton("📱 Telefon raqamini yuborish", request_contact=True)]]
-        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-        await update.message.reply_text(f"Salom {text}! Telefon raqamingizni yuboring:", reply_markup=reply_markup)
+        reply_markup = ReplyKeyboardMarkup(
+            keyboard,
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        )
+        await update.message.reply_text(
+            f"Salom {text}! Telefon raqamingizni yuboring:",
+            reply_markup=reply_markup,
+        )
+        return
 
-    # Maxfiy chat
-    elif context.user_data.get("secret_chat", False):
-        messages_dict[user_id] = messages_dict.get(user_id, [])
-        messages_dict[user_id].append(text)
+    target_user_id = context.user_data.get("chat_with")
+    if target_user_id:
+        await send_user_message(update, context, target_user_id, text)
+        return
 
-        # Adminga yuborish
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"{update.message.from_user.full_name} ({user_id}): {text}")
-        await update.message.reply_text("Xabaringiz yuborildi ✅")
+    await update.message.reply_text("Menyu:", reply_markup=main_menu())
 
-# ===== Kontakt qabul qilish =====
+
+async def send_user_message(update, context, target_user_id, message):
+    sender = update.effective_user
+    save_user(sender.id, sender.full_name)
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=(
+                f"📩 Sizga {sender.full_name} dan xabar:\n\n"
+                f"{message}\n\n"
+                f"Javob berish uchun /reply {sender.id} <xabar>"
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("↩️ Javob yozish", callback_data=f"chat_{sender.id}")]]
+            ),
+        )
+    except TelegramError:
+        await update.message.reply_text(
+            "Xabar yuborilmadi. U odam avval botga /start bosgan bo'lishi kerak."
+        )
+        return
+
+    await update.message.reply_text("Xabaringiz yuborildi ✅")
+
+
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     contact = update.message.contact
-    with open("users.txt", "a", encoding="utf-8") as f:
-        f.write(f"{contact.first_name} - {contact.phone_number}\n")
+    user = update.effective_user
+    save_user(user.id, user.full_name)
 
-    # Menyu
-    keyboard = [
-        [InlineKeyboardButton("👑 Bot asoschisi", callback_data='founder')],
-        [InlineKeyboardButton("📷 Rasm yuborish", callback_data='upload')],
-        [InlineKeyboardButton("💬 Maxfiy chat", callback_data='secret')],
-        [InlineKeyboardButton("🎮 Quiz o'ynash", callback_data='quiz')],
-        [InlineKeyboardButton("📝 Profilim", callback_data='profile')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"Rahmat, {contact.first_name}! Telefon raqamingiz qabul qilindi ✅\nMenyu:", reply_markup=reply_markup)
+    await update.message.reply_text(
+        f"Rahmat, {contact.first_name}! Telefon raqamingiz qabul qilindi ✅\nMenyu:",
+        reply_markup=main_menu(),
+    )
 
-# ===== Inline tugmalar =====
+
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
+    save_user(user_id, query.from_user.full_name)
 
-    if query.data == "founder":
-        with open("images/image1.jpg", "rb") as photo:
-            await query.message.reply_photo(photo=photo, caption="Bot asoschisi: Jonibek 🤖")
+    if query.data == "menu":
+        context.user_data.pop("chat_with", None)
+        await query.message.reply_text("Menyu:", reply_markup=main_menu())
+
+    elif query.data == "founder":
+        image_path = IMAGES_DIR / "image1.jpg"
+        if image_path.exists():
+            with image_path.open("rb") as photo:
+                await query.message.reply_photo(photo=photo, caption="Bot asoschisi: Jonibek 🤖")
+        else:
+            await query.message.reply_text("Founder rasmi topilmadi.")
 
     elif query.data == "upload":
         await query.message.reply_text("Rasm yoki fayl yuboring va u avtomatik saqlanadi:")
         context.user_data["waiting_for_photo"] = True
 
-    elif query.data == "secret":
-        await query.message.reply_text("Maxfiy chat boshladingiz. Xabar yozing:")
-        context.user_data["secret_chat"] = True
+    elif query.data == "message":
+        users = read_users()
+        if len(users) <= 1:
+            await query.message.reply_text("Hozircha boshqa foydalanuvchilar yo'q.")
+            return
+
+        await query.message.reply_text(
+            "Kimga xabar yubormoqchisiz?",
+            reply_markup=users_keyboard(user_id),
+        )
+
+    elif query.data.startswith("chat_"):
+        target_user_id = int(query.data.removeprefix("chat_"))
+        target_name = read_users().get(target_user_id, "foydalanuvchi")
+
+        context.user_data["chat_with"] = target_user_id
+        await query.message.reply_text(
+            f"{target_name} ga xabar yozing. Tugatish uchun /menu bosing."
+        )
 
     elif query.data == "quiz":
-        question, options, correct = random.choice([
-            ("Python nima?", ["Til", "Hayvon", "Oziq-ovqat"], "Til"),
-            ("2+2=?", ["3", "4", "5"], "4")
-        ])
+        question, options, correct = random.choice(
+            [
+                ("Python nima?", ["Til", "Hayvon", "Oziq-ovqat"], "Til"),
+                ("2+2=?", ["3", "4", "5"], "4"),
+            ]
+        )
         context.user_data["quiz_answer"] = correct
-        buttons = [[InlineKeyboardButton(opt, callback_data="quiz_"+opt)] for opt in options]
+        buttons = [[InlineKeyboardButton(opt, callback_data="quiz_" + opt)] for opt in options]
         await query.message.reply_text(question, reply_markup=InlineKeyboardMarkup(buttons))
 
     elif query.data.startswith("quiz_"):
         answer = query.data[5:]
         if answer == context.user_data.get("quiz_answer"):
             await query.message.reply_text("To'g'ri javob ✅")
-            _update_score(user_id, 1)
+            update_score(user_id, 1)
         else:
             await query.message.reply_text("Noto'g'ri javob ❌")
 
     elif query.data == "profile":
-        name = context.user_data.get("name", "NoName")
-        score = _get_score(user_id)
+        name = context.user_data.get("name", query.from_user.full_name)
+        score = get_score(user_id)
         await query.message.reply_text(f"👤 Profil:\nIsm: {name}\nBall: {score}")
 
-# ===== Rasm yoki fayl qabul qilish =====
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("chat_with", None)
+    await update.message.reply_text("Menyu:", reply_markup=main_menu())
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("waiting_for_photo", False):
-        photo_file = await update.message.photo[-1].get_file()
-        file_path = f"images/{update.message.from_user.id}_{photo_file.file_id}.jpg"
-        await photo_file.download_to_drive(file_path)
-        await update.message.reply_text("Rasm saqlandi ✅")
-        context.user_data["waiting_for_photo"] = False
+    if not context.user_data.get("waiting_for_photo"):
+        return
+
+    photo_file = await update.message.photo[-1].get_file()
+    file_path = IMAGES_DIR / f"{update.message.from_user.id}_{photo_file.file_id}.jpg"
+    await photo_file.download_to_drive(file_path)
+    await update.message.reply_text("Rasm saqlandi ✅")
+    context.user_data["waiting_for_photo"] = False
+
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await update.message.document.get_file()
-    file_path = f"images/{update.message.from_user.id}_{update.message.document.file_name}"
+    file_path = IMAGES_DIR / f"{update.message.from_user.id}_{update.message.document.file_name}"
     await file.download_to_drive(file_path)
     await update.message.reply_text("Fayl saqlandi ✅")
 
-# ===== Admin javoblari =====
-async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id != ADMIN_ID:
-        return
-    text = update.message.text
-    if not text.lower().startswith("/reply "):
-        return
-    try:
-        _, user_id_str, message = text.split(" ", 2)
-        user_id = int(user_id_str)
-        await context.bot.send_message(chat_id=user_id, text=message)
-        await update.message.reply_text(f"Xabar foydalanuvchiga yuborildi ✅")
-    except:
-        await update.message.reply_text("Xatolik! Format: /reply <user_id> <xabar>")
 
-# ===== Ball tizimi =====
-def _update_score(user_id, point):
+def update_score(user_id, point):
     scores = {}
-    with open("scores.txt", "r", encoding="utf-8") as f:
-        for line in f.readlines():
-            uid, sc = line.strip().split(" - ")
-            scores[int(uid)] = int(sc)
+    for line in SCORES_FILE.read_text(encoding="utf-8").splitlines():
+        if " - " not in line:
+            continue
+        uid, score = line.strip().split(" - ", 1)
+        if uid.isdigit() and score.isdigit():
+            scores[int(uid)] = int(score)
+
     scores[user_id] = scores.get(user_id, 0) + point
-    with open("scores.txt", "w", encoding="utf-8") as f:
-        for uid, sc in scores.items():
-            f.write(f"{uid} - {sc}\n")
 
-def _get_score(user_id):
-    scores = {}
-    with open("scores.txt", "r", encoding="utf-8") as f:
-        for line in f.readlines():
-            uid, sc = line.strip().split(" - ")
-            scores[int(uid)] = int(sc)
-    return scores.get(user_id, 0)
+    with SCORES_FILE.open("w", encoding="utf-8") as file:
+        for uid, score in scores.items():
+            file.write(f"{uid} - {score}\n")
 
-# ===== Bot ishga tushirish =====
+
+def get_score(user_id):
+    for line in SCORES_FILE.read_text(encoding="utf-8").splitlines():
+        if " - " not in line:
+            continue
+        uid, score = line.strip().split(" - ", 1)
+        if uid.isdigit() and int(uid) == user_id and score.isdigit():
+            return int(score)
+    return 0
+
+
 app = ApplicationBuilder().token(TOKEN).build()
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("menu", menu_command))
+app.add_handler(CommandHandler("users", users_command))
+app.add_handler(CommandHandler("reply", reply_command))
 app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 app.add_handler(CallbackQueryHandler(button))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_reply))
 
 print("Bot ishga tushdi...")
 app.run_polling()
